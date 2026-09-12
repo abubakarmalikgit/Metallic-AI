@@ -36,7 +36,7 @@ logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("MetallicAI-Core")
+logger = logging.getLogger("Metallic-AI-Core")
 logging.getLogger("discord.client").setLevel(logging.ERROR)
 
 # -------------------------------------------------------------
@@ -74,6 +74,11 @@ validate_environment()
 
 # -------------------------------------------------------------
 # 3. Live Discord Log Streaming
+#
+#    Batches every 1.5s to stay clear of Discord rate limits
+#    during error bursts (e.g. a probe storm). Only ships to
+#    a single admin-configured channel — never falls back
+#    elsewhere. Auto-disables itself after repeated failures.
 # -------------------------------------------------------------
 log_buffer = deque(maxlen=1000)
 log_buffer_lock = threading.Lock()
@@ -205,6 +210,12 @@ def run_key_diagnostic() -> dict:
 
 # -------------------------------------------------------------
 # 7. Dynamic Model Discovery Engine (+ Locked Model Override)
+#
+#    If `locked_model` is set (via /setmodel), discovery is
+#    SKIPPED ENTIRELY on every boot — no probe sweep, no
+#    wasted API calls, instant startup. Discovery only runs
+#    if no model is locked, or if the locked model itself
+#    fails during a real request.
 # -------------------------------------------------------------
 ACTIVE_ENGINE = locked_model or AI_MODEL_NAME or "auto-detecting..."
 _engine_lock = threading.Lock()
@@ -294,6 +305,8 @@ def probe_model(model_name: str) -> bool:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
         if resp.status_code == 200:
             return True
+        # Only permanently blacklist REAL failures (dead/no-access model),
+        # never a transient timeout.
         if resp.status_code in (404, 410):
             _known_bad_models.add(model_name)
         logger.warning(f"Probe failed for {model_name} (HTTP {resp.status_code}): {resp.text[:200]}")
@@ -306,6 +319,7 @@ def probe_model(model_name: str) -> bool:
 def _select_verified_model_blocking() -> str:
     global ACTIVE_ENGINE
 
+    # Locked model always wins — zero discovery overhead.
     if locked_model:
         with _engine_lock:
             ACTIVE_ENGINE = locked_model
@@ -439,12 +453,17 @@ async def send_chunked(interaction_or_channel, reply: str, is_interaction: bool 
         else:
             await interaction_or_channel.send(reply)
         return
+    first = True
     for i in range(0, len(reply), chunk_size):
         chunk = reply[i:i + chunk_size]
         if is_interaction:
-            await interaction_or_channel.followup.send(chunk)
+            if first:
+                await interaction_or_channel.followup.send(chunk)
+            else:
+                await interaction_or_channel.channel.send(chunk)
         else:
             await interaction_or_channel.send(chunk)
+        first = False
 
 # -------------------------------------------------------------
 # 9. Chat Completion Pipeline
@@ -929,24 +948,19 @@ async def on_message(message: discord.Message):
     is_dm = isinstance(message.channel, discord.DMChannel)
 
     if not is_dm and message.guild and "discord.gg/" in message.content.lower():
-        author_perms = getattr(message.author, "guild_permissions", None)
-        if not (author_perms and author_perms.administrator):
-            try:
-                await message.delete()
-                await message.channel.send(f"⚠️ {message.author.mention}, invite links are prohibited.", delete_after=4)
-            except Exception:
-                pass
+        if not message.author.guild_permissions.administrator:
+            await message.delete()
+            await message.channel.send(f"⚠️ {message.author.mention}, invite links are prohibited.", delete_after=4)
             return
 
-    is_mentioned = bot.user in message.mentions if bot.user else False
+    is_mentioned = bot.user in message.mentions
     clean_channel = normalize_name(getattr(message.channel, "name", ""))
-    is_dedicated = "metallic" in clean_channel
+    is_dedicated = ("metallicai" in clean_channel or "metallic-ai" in clean_channel)
 
     if not (is_dedicated or is_mentioned or is_dm):
         return
 
-    bot_id = bot.user.id if bot.user else 0
-    clean_text = message.content.replace(f"<@{bot_id}>", "").replace(f"<@!{bot_id}>", "").strip()
+    clean_text = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
     if not clean_text:
         await message.channel.send("Hello! What can I help you with today?")
         return
@@ -1005,7 +1019,7 @@ async def log_shipper_task():
                 asyncio.create_task(save_data())
             return
 
-    perms = channel.permissions_for(channel.guild.me) if hasattr(channel, "guild") and channel.guild else None
+    perms = channel.permissions_for(channel.guild.me) if hasattr(channel, "guild") else None
     if perms and (not perms.send_messages or not perms.embed_links):
         _log_failure_streak += 1
         if _log_failure_streak >= MAX_LOG_FAILURES_BEFORE_DISABLE:
@@ -1054,6 +1068,9 @@ async def cleanup_task():
 
 @tasks.loop(minutes=30)
 async def engine_health_check():
+    """Even locked models get periodically health-checked — if a
+    locked model dies (retired/revoked), auto-discovery kicks in
+    as a safety net rather than the bot going permanently silent."""
     global locked_model
     is_alive = await asyncio.to_thread(probe_model, ACTIVE_ENGINE)
     if not is_alive:
